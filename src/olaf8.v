@@ -1,170 +1,290 @@
+/*
+ * OLAF-8: Drastic-area experimental candidate
+ * Tiny Tapeout SKY130 / Verilog
+ *
+ * AREA-FIRST ARCHITECTURAL CHANGE:
+ * The original weighted singleton-centroid datapath
+ * (8x product accumulation + restoring divider) is removed.
+ *
+ * New defuzzification:
+ *   y = consequent of the rule with maximum MIN firing strength
+ *       (winner-take-all / max-fire singleton output)
+ *
+ * Preserved:
+ *   - 8 bounded rule slots
+ *   - 2-input fuzzy membership
+ *   - MIN firing strength
+ *   - firing-strength-gated online admission
+ *   - least-utility rule replacement
+ *   - shared streaming datapath
+ *   - observable admission output
+ *   - Tiny Tapeout interface
+ *
+ * IMPORTANT:
+ * This is intentionally a drastic architectural experiment.
+ * It is NOT numerically equivalent to the original weighted-average
+ * output. Existing expected y-values may therefore change.
+ * The <=566-cell target must be confirmed by synthesis/GDS.
+ */
+
 `default_nettype none
 
-module tt_um_olaf8(
+module tt_um_olaf8 (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
     input  wire [7:0] uio_in,
     output wire [7:0] uio_out,
     output wire [7:0] uio_oe,
-    input  wire ena,
-    input  wire clk,
-    input  wire rst_n
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n
 );
 
     wire [3:0] y;
-    wire done, admitted, busy;
+    wire       done;
+    wire       admitted;
+    wire       busy;
 
-    olaf8_core core(
-        .x1(ui_in[7:4]), .x2(ui_in[3:0]),
-        .start(uio_in[0] & ena), .clk(clk), .rst_n(rst_n),
-        .y(y), .done(done), .admitted(admitted), .busy(busy)
+    olaf8_core core (
+        .x1(ui_in[7:4]),
+        .x2(ui_in[3:0]),
+        .start(uio_in[0] & ena),
+        .clk(clk),
+        .rst_n(rst_n),
+        .y(y),
+        .done(done),
+        .admitted(admitted),
+        .busy(busy)
     );
 
-    assign uo_out  = {1'b0,busy,admitted,done,y};
+    assign uo_out  = {1'b0, busy, admitted, done, y};
     assign uio_out = 8'b0;
     assign uio_oe  = 8'b0;
 
 endmodule
 
 
-module olaf8_core(
-    input  wire [3:0] x1, x2,
-    input  wire start, clk, rst_n,
+module olaf8_core (
+    input  wire [3:0] x1,
+    input  wire [3:0] x2,
+    input  wire       start,
+    input  wire       clk,
+    input  wire       rst_n,
+
     output reg [3:0] y,
-    output reg done, admitted, busy
+    output reg       done,
+    output reg       admitted,
+    output reg       busy
 );
 
     /*
-     * One packed word per bounded rule:
-     * [10:9] a1, [8:7] a2, [6:3] consequent, [2:0] utility.
+     * Packed rule:
+     * [10:9] antecedent 1
+     * [ 8:7] antecedent 2
+     * [ 6:3] consequent
+     * [ 2:0] utility
      */
     reg [10:0] rule [0:7];
 
-    reg [3:0] x1_r, x2_r;
-    reg [2:0] idx;
-    reg [2:0] min_idx;
-    reg [2:0] min_u;
+    reg [3:0] x1_r;
+    reg [3:0] x2_r;
+
+    reg [2:0] rule_idx;
+
+    /* Winner so far. */
     reg [3:0] max_fire;
     reg [2:0] max_idx;
+    reg [3:0] max_y;
+
+    /* Least-utility slot so far. */
+    reg [2:0] min_util;
+    reg [2:0] min_idx;
 
     /*
-     * Shared accumulation state.
-     * numerator <= 8*15*15 = 1800
-     * denominator <= 8*15 = 120
+     * One shared membership evaluator.
+     * phase=0: evaluate x1 / antecedent 1
+     * phase=1: evaluate x2 / antecedent 2
+     *
+     * Two cycles per rule => 16 cycles total.
      */
-    reg [10:0] num;
-    reg [6:0] den;
+    reg       mem_phase;
+    reg [3:0] m1_hold;
 
-    /*
-     * Quotient state. Only a 4-bit saturated output is required.
-     * At most 15 useful subtractions are needed.
-     */
-    reg [10:0] qnum;
-    reg [6:0] qden;
-    reg [3:0] q;
-    reg [3:0] qcount;
+    reg state;
+    localparam S_IDLE = 1'b0;
+    localparam S_SCAN = 1'b1;
 
-    reg [1:0] state;
-    localparam IDLE=2'd0, SCAN=2'd1, QUOT=2'd2;
 
-    function [3:0] mf;
+    // ============================================================
+    // Exact finite membership mapping
+    // ============================================================
+
+    function [3:0] membership;
         input [3:0] x;
-        input [1:0] l;
+        input [1:0] label;
+
         begin
-            case(l)
+            case (label)
+
                 2'd0: begin
-                    case(x)
-                        0:mf=15; 1:mf=13; 2:mf=11; 3:mf=9;
-                        4:mf=7;  5:mf=5;  6:mf=3;  7:mf=1;
-                        default:mf=0;
+                    case (x)
+                        4'd0: membership = 4'd15;
+                        4'd1: membership = 4'd13;
+                        4'd2: membership = 4'd11;
+                        4'd3: membership = 4'd9;
+                        4'd4: membership = 4'd7;
+                        4'd5: membership = 4'd5;
+                        4'd6: membership = 4'd3;
+                        4'd7: membership = 4'd1;
+                        default: membership = 4'd0;
                     endcase
                 end
+
                 2'd1: begin
-                    case(x)
-                        0:mf=0;  1:mf=2;  2:mf=4;  3:mf=6;
-                        4:mf=8;  5:mf=10; 6:mf=12; 7:mf=14;
-                        8:mf=14; 9:mf=12; 10:mf=10; 11:mf=8;
-                        12:mf=6; 13:mf=4; 14:mf=2; default:mf=0;
+                    case (x)
+                        4'd0:  membership = 4'd0;
+                        4'd1:  membership = 4'd2;
+                        4'd2:  membership = 4'd4;
+                        4'd3:  membership = 4'd6;
+                        4'd4:  membership = 4'd8;
+                        4'd5:  membership = 4'd10;
+                        4'd6:  membership = 4'd12;
+                        4'd7:  membership = 4'd14;
+                        4'd8:  membership = 4'd14;
+                        4'd9:  membership = 4'd12;
+                        4'd10: membership = 4'd10;
+                        4'd11: membership = 4'd8;
+                        4'd12: membership = 4'd6;
+                        4'd13: membership = 4'd4;
+                        4'd14: membership = 4'd2;
+                        default: membership = 4'd0;
                     endcase
                 end
+
                 default: begin
-                    case(x)
-                        0,1,2,3,4,5,6,7:mf=0;
-                        8:mf=2; 9:mf=4; 10:mf=6; 11:mf=8;
-                        12:mf=10; 13:mf=12; 14:mf=14; default:mf=15;
+                    case (x)
+                        4'd0,
+                        4'd1,
+                        4'd2,
+                        4'd3,
+                        4'd4,
+                        4'd5,
+                        4'd6,
+                        4'd7:  membership = 4'd0;
+                        4'd8:  membership = 4'd2;
+                        4'd9:  membership = 4'd4;
+                        4'd10: membership = 4'd6;
+                        4'd11: membership = 4'd8;
+                        4'd12: membership = 4'd10;
+                        4'd13: membership = 4'd12;
+                        4'd14: membership = 4'd14;
+                        default: membership = 4'd15;
                     endcase
                 end
+
             endcase
         end
     endfunction
 
-    function [1:0] peak;
+
+    // ============================================================
+    // Peak label for admission
+    // ============================================================
+
+    function [1:0] peak_label;
         input [3:0] x;
         begin
-            if(x<=3) peak=0;
-            else if(x<=11) peak=1;
-            else peak=2;
+            if (x <= 4'd3)
+                peak_label = 2'd0;
+            else if (x <= 4'd11)
+                peak_label = 2'd1;
+            else
+                peak_label = 2'd2;
         end
     endfunction
 
-    wire [1:0] a1 = rule[idx][10:9];
-    wire [1:0] a2 = rule[idx][8:7];
-    wire [3:0] ry = rule[idx][6:3];
-    wire [2:0] ru = rule[idx][2:0];
 
-    wire [3:0] m1 = mf(x1_r,a1);
-    wire [3:0] m2 = mf(x2_r,a2);
-    wire [3:0] fire = (m1<m2)?m1:m2;
+    // ============================================================
+    // Current rule
+    // ============================================================
 
-    /*
-     * Small 4x4 product. The synthesizer can share the add structure.
-     */
-    wire [7:0] p =
-        (fire[0] ? {4'b0,ry} : 8'b0) +
-        (fire[1] ? {3'b0,ry,1'b0} : 8'b0) +
-        (fire[2] ? {2'b0,ry,2'b0} : 8'b0) +
-        (fire[3] ? {1'b0,ry,3'b0} : 8'b0);
+    wire [10:0] cur_rule = rule[rule_idx];
 
-    wire [10:0] nlast = num + {3'b0,p};
-    wire [6:0]  dlast = den + {3'b0,fire};
+    wire [1:0] cur_a1 = cur_rule[10:9];
+    wire [1:0] cur_a2 = cur_rule[8:7];
+    wire [3:0] cur_y  = cur_rule[6:3];
+    wire [2:0] cur_u  = cur_rule[2:0];
 
-    wire [3:0] fmax = (fire>max_fire)?fire:max_fire;
-    wire [2:0] imax = (fire>max_fire)?idx:max_idx;
 
-    wire qsub = (qnum >= {4'b0,qden});
+    // Shared membership result.
+    wire [3:0] mem_now =
+        mem_phase
+        ? membership(x2_r, cur_a2)
+        : membership(x1_r, cur_a1);
 
-    /*
-     * Finalize operation in one common path. This avoids duplicating
-     * admission/update logic in several FSM branches.
-     */
-    reg [3:0] final_y;
-    reg final_admit;
+
+    // Final firing strength for the current rule.
+    wire [3:0] cur_fire =
+        (m1_hold < mem_now)
+        ? m1_hold
+        : mem_now;
+
+
+    // Final winner including the current rule.
+    wire final_is_current =
+        (cur_fire > max_fire);
+
+
+    wire [3:0] final_fire =
+        final_is_current ? cur_fire : max_fire;
+
+    wire [3:0] final_y =
+        final_is_current ? cur_y : max_y;
+
+    wire [2:0] final_winner_idx =
+        final_is_current ? rule_idx : max_idx;
+
+
+    // Final least-utility slot including current rule.
+    wire final_is_current_min =
+        (cur_u < min_util);
+
+    wire [2:0] final_replace_idx =
+        final_is_current_min ? rule_idx : min_idx;
+
+
+    // ============================================================
+    // Sequential engine
+    // ============================================================
 
     always @(posedge clk or negedge rst_n) begin
-        if(!rst_n) begin
-            state <= IDLE;
-            y <= 4'd8;
-            done <= 0;
-            admitted <= 0;
-            busy <= 0;
 
-            x1_r <= 0;
-            x2_r <= 0;
-            idx <= 0;
+        if (!rst_n) begin
 
-            min_idx <= 0;
-            min_u <= 7;
-            max_fire <= 0;
-            max_idx <= 0;
+            state    <= S_IDLE;
 
-            num <= 0;
-            den <= 0;
+            y        <= 4'd8;
+            done     <= 1'b0;
+            admitted <= 1'b0;
+            busy     <= 1'b0;
 
-            qnum <= 0;
-            qden <= 1;
-            q <= 0;
-            qcount <= 0;
+            x1_r <= 4'd0;
+            x2_r <= 4'd0;
 
+            rule_idx <= 3'd0;
+
+            max_fire <= 4'd0;
+            max_idx  <= 3'd0;
+            max_y    <= 4'd8;
+
+            min_util <= 3'd7;
+            min_idx  <= 3'd0;
+
+            mem_phase <= 1'b0;
+            m1_hold   <= 4'd0;
+
+
+            /* Same deterministic initial 8-rule base. */
             rule[0] <= 11'b00_00_0010_001;
             rule[1] <= 11'b00_01_0101_001;
             rule[2] <= 11'b00_10_0111_001;
@@ -173,143 +293,158 @@ module olaf8_core(
             rule[5] <= 11'b01_10_1010_001;
             rule[6] <= 11'b10_00_0111_001;
             rule[7] <= 11'b10_10_1101_001;
-        end else begin
-            done <= 0;
-            admitted <= 0;
 
-            case(state)
+        end
 
-                IDLE: begin
-                    busy <= 0;
-                    if(start) begin
+        else begin
+
+            done     <= 1'b0;
+            admitted <= 1'b0;
+
+            case (state)
+
+                // ==================================================
+                // IDLE
+                // ==================================================
+
+                S_IDLE: begin
+
+                    busy <= 1'b0;
+
+                    if (start) begin
+
                         x1_r <= x1;
                         x2_r <= x2;
-                        idx <= 0;
 
-                        min_idx <= 0;
-                        min_u <= 7;
+                        rule_idx <= 3'd0;
 
-                        max_fire <= 0;
-                        max_idx <= 0;
+                        max_fire <= 4'd0;
+                        max_idx  <= 3'd0;
+                        max_y    <= 4'd8;
 
-                        num <= 0;
-                        den <= 0;
+                        min_util <= 3'd7;
+                        min_idx  <= 3'd0;
 
-                        busy <= 1;
-                        state <= SCAN;
+                        mem_phase <= 1'b0;
+                        m1_hold   <= 4'd0;
+
+                        busy  <= 1'b1;
+                        state <= S_SCAN;
+
                     end
+
                 end
 
-                SCAN: begin
-                    busy <= 1;
 
-                    num <= num + {3'b0,p};
-                    den <= den + {3'b0,fire};
+                // ==================================================
+                // SHARED 2-CYCLE RULE EVALUATION
+                // ==================================================
 
-                    if(ru < min_u) begin
-                        min_u <= ru;
-                        min_idx <= idx;
-                    end
+                S_SCAN: begin
 
-                    if(fire > max_fire) begin
-                        max_fire <= fire;
-                        max_idx <= idx;
-                    end
+                    busy <= 1'b1;
 
-                    if(idx==7) begin
-                        qnum <= nlast;
-                        qden <= (dlast==0) ? 7'd1 : dlast;
-                        q <= 0;
-                        qcount <= 0;
+                    if (!mem_phase) begin
 
-                        max_fire <= fmax;
-                        max_idx <= imax;
-
-                        state <= QUOT;
-                    end else begin
-                        idx <= idx + 1'b1;
-                    end
-                end
-
-                QUOT: begin
-                    busy <= 1;
-
-                    /*
-                     * Zero denominator: baseline output behavior.
-                     * Admission still occurs and receives y=8.
-                     */
-                    if(den==0) begin
-                        final_y <= 0;
-                        final_admit <= (max_fire < 6);
-                        y <= 0;
-
-                        if(max_fire < 6) begin
-                            rule[min_idx][10:9] <= peak(x1_r);
-                            rule[min_idx][8:7] <= peak(x2_r);
-                            rule[min_idx][6:3] <= 4'd8;
-                            rule[min_idx][2:0] <= 3'd4;
-                            admitted <= 1;
-                        end else if(rule[max_idx][2:0] != 7) begin
-                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
-                        end
-
-                        done <= 1;
-                        busy <= 0;
-                        state <= IDLE;
-
-                    end else if(!qsub) begin
                         /*
-                         * Exact floor quotient has been reached.
+                         * First half:
+                         * calculate membership of antecedent 1.
                          */
-                        final_y <= q;
-                        final_admit <= (max_fire < 6);
-                        y <= q;
+                        m1_hold   <= mem_now;
+                        mem_phase <= 1'b1;
 
-                        if(max_fire < 6) begin
-                            rule[min_idx][10:9] <= peak(x1_r);
-                            rule[min_idx][8:7] <= peak(x2_r);
-                            rule[min_idx][6:3] <= q;
-                            rule[min_idx][2:0] <= 3'd4;
-                            admitted <= 1;
-                        end else if(rule[max_idx][2:0] != 7) begin
-                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
-                        end
-
-                        done <= 1;
-                        busy <= 0;
-                        state <= IDLE;
-
-                    end else if(q==4'd15 || qcount==4'd15) begin
-                        /*
-                         * Saturated 4-bit result.
-                         */
-                        y <= 4'd15;
-
-                        if(max_fire < 6) begin
-                            rule[min_idx][10:9] <= peak(x1_r);
-                            rule[min_idx][8:7] <= peak(x2_r);
-                            rule[min_idx][6:3] <= 4'd15;
-                            rule[min_idx][2:0] <= 3'd4;
-                            admitted <= 1;
-                        end else if(rule[max_idx][2:0] != 7) begin
-                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
-                        end
-
-                        done <= 1;
-                        busy <= 0;
-                        state <= IDLE;
-
-                    end else begin
-                        qnum <= qnum - {4'b0,qden};
-                        q <= q + 1'b1;
-                        qcount <= qcount + 1'b1;
                     end
+
+                    else begin
+
+                        /*
+                         * Second half:
+                         * calculate antecedent 2, then MIN.
+                         */
+
+                        /* Update running winner. */
+                        if (cur_fire > max_fire) begin
+                            max_fire <= cur_fire;
+                            max_idx  <= rule_idx;
+                            max_y    <= cur_y;
+                        end
+
+                        /* Update running least-utility slot. */
+                        if (cur_u < min_util) begin
+                            min_util <= cur_u;
+                            min_idx  <= rule_idx;
+                        end
+
+                        mem_phase <= 1'b0;
+
+                        if (rule_idx == 3'd7) begin
+
+                            /*
+                             * Finalize using the current rule as well.
+                             * This avoids the usual nonblocking-assignment
+                             * last-cycle omission.
+                             */
+                            y <= final_y;
+
+                            /*
+                             * Core admission mechanism is unchanged:
+                             * weak maximum firing => admit/replace.
+                             */
+                            if (final_fire < 4'd6) begin
+
+                                rule[final_replace_idx][10:9]
+                                    <= peak_label(x1_r);
+
+                                rule[final_replace_idx][8:7]
+                                    <= peak_label(x2_r);
+
+                                /*
+                                 * In winner-take-all mode, the new rule's
+                                 * consequent is the inferred winner output.
+                                 */
+                                rule[final_replace_idx][6:3]
+                                    <= final_y;
+
+                                rule[final_replace_idx][2:0]
+                                    <= 3'd4;
+
+                                admitted <= 1'b1;
+
+                            end
+
+                            else begin
+
+                                if (rule[final_winner_idx][2:0] != 3'd7)
+                                    rule[final_winner_idx][2:0]
+                                        <= rule[final_winner_idx][2:0] + 3'd1;
+
+                            end
+
+                            done  <= 1'b1;
+                            busy  <= 1'b0;
+                            state <= S_IDLE;
+
+                        end
+
+                        else begin
+
+                            rule_idx <= rule_idx + 3'd1;
+
+                        end
+
+                    end
+
                 end
 
-                default: state <= IDLE;
+
+                default: begin
+                    state <= S_IDLE;
+                end
 
             endcase
+
         end
+
     end
 
 endmodule
