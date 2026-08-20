@@ -1,29 +1,21 @@
-`default_nettype none
+/*
+ * OLAF-8: Bounded-Memory Online Adaptive Fuzzy Inference Engine
+ * Tiny Tapeout SKY130 / Verilog
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * 50%-TARGET EXPERIMENTAL ORGANIZATION
+ *
+ * Changes from the supplied 1,132-cell reference RTL:
+ *   1. Rule fields are packed into one 11-bit word per slot.
+ *   2. Least-utility search is performed during the existing 8-cycle scan.
+ *   3. Defuzzification uses a bounded subtractive quotient engine.
+ *
+ * IMPORTANT:
+ * This is an area-optimization candidate. The <=566-cell target
+ * must be confirmed by the actual Tiny Tapeout synthesis/GDS flow.
+ */
 
-// ============================================================
-// OLAF-8
-// Bounded-Memory Online Adaptive Fuzzy Inference Engine
-//
-// STEP 1 OPTIMIZATION:
-// Sequential least-utility rule selection.
-//
-// The existing 8-cycle rule scan is reused to determine the
-// least-utility rule. This removes the combinational 8-entry
-// minimum-selection network.
-//
-// Tiny Tapeout interface:
-//
-// ui_in[7:4] : x1
-// ui_in[3:0] : x2
-// uio_in[0]  : start
-//
-// uo_out[3:0] : fuzzy output y
-// uo_out[4]   : done
-// uo_out[5]   : admitted/replaced
-// uo_out[6]   : busy
-// uo_out[7]   : reserved = 0
-//
-// ============================================================
+`default_nettype none
 
 module tt_um_olaf8 (
     input  wire [7:0] ui_in,
@@ -31,9 +23,9 @@ module tt_um_olaf8 (
     input  wire [7:0] uio_in,
     output wire [7:0] uio_out,
     output wire [7:0] uio_oe,
-    input  wire ena,
-    input  wire clk,
-    input  wire rst_n
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n
 );
 
     wire [3:0] y;
@@ -53,17 +45,14 @@ module tt_um_olaf8 (
         .busy(busy)
     );
 
-    assign uo_out = {1'b0, busy, admitted, done, y};
-
+    assign uo_out  = {1'b0, busy, admitted, done, y};
     assign uio_out = 8'b0;
     assign uio_oe  = 8'b0;
 
+    wire _unused = &{1'b0, uio_in[7:1], 1'b0};
+
 endmodule
 
-
-// ============================================================
-// OLAF-8 CORE
-// ============================================================
 
 module olaf8_core (
     input  wire [3:0] x1,
@@ -71,308 +60,195 @@ module olaf8_core (
     input  wire       start,
     input  wire       clk,
     input  wire       rst_n,
-
-    output reg [3:0] y,
-    output reg       done,
-    output reg       admitted,
-    output reg       busy
+    output reg  [3:0] y,
+    output reg        done,
+    output reg        admitted,
+    output reg        busy
 );
-
-    // --------------------------------------------------------
-    // Fixed OLAF-8 parameters
-    // --------------------------------------------------------
 
     localparam [3:0] ADMIT_THRESHOLD = 4'd6;
 
-    // Rules 0 through 7.
-    localparam [2:0] N_RULES = 3'd7;
-
-
-    // --------------------------------------------------------
-    // Rule memory
-    //
-    // antecedent label:
-    //   0 = LOW
-    //   1 = MID
-    //   2 = HIGH
-    //
-    // consequent:
-    //   4-bit singleton output
-    //
-    // utility:
-    //   3-bit saturating usage score
-    // --------------------------------------------------------
-
-    reg [1:0] rule_a1 [0:7];
-    reg [1:0] rule_a2 [0:7];
-    reg [3:0] rule_y  [0:7];
-    reg [2:0] rule_u  [0:7];
-
-
-    // --------------------------------------------------------
-    // Captured input
-    // --------------------------------------------------------
+    /*
+     * Packed rule:
+     *
+     *   rule_mem[i][10:9] = antecedent 1
+     *   rule_mem[i][ 8:7] = antecedent 2
+     *   rule_mem[i][ 6:3] = consequent
+     *   rule_mem[i][ 2:0] = utility
+     *
+     * 11 bits/rule × 8 rules = 88 persistent bits.
+     */
+    reg [10:0] rule_mem [0:7];
 
     reg [3:0] x1_r;
     reg [3:0] x2_r;
 
-
-    // --------------------------------------------------------
-    // Rule scan state
-    // --------------------------------------------------------
-
     reg [2:0] rule_idx;
 
-    // Maximum firing strength and corresponding rule.
     reg [3:0] max_fire;
     reg [2:0] max_idx;
 
-
-    // --------------------------------------------------------
-    // STEP 1 OPTIMIZATION
-    //
-    // Sequential least-utility search.
-    //
-    // These two registers replace the previous combinational
-    // 8-rule minimum selector.
-    // --------------------------------------------------------
-
+    /* Sequential least-utility selection. */
     reg [2:0] min_util_r;
     reg [2:0] min_idx_r;
 
-
-    // --------------------------------------------------------
-    // Weighted accumulation
-    // --------------------------------------------------------
-
+    /*
+     * Accumulation bounds:
+     *
+     * alpha <= 15
+     * consequent <= 15
+     * 8 rules
+     *
+     * numerator <= 8*15*15 = 1800
+     * denominator <= 8*15 = 120
+     *
+     * 11 bits are therefore sufficient for numerator.
+     * 7 bits are sufficient for denominator.
+     */
     reg [10:0] sum_num;
     reg [6:0]  sum_den;
 
-
-    // --------------------------------------------------------
-    // Iterative restoring divider
-    // --------------------------------------------------------
-
-    reg [10:0] div_num;
-    reg [7:0]  div_rem;
-    reg [6:0]  div_den;
-    reg [10:0] div_quot;
-    reg [3:0]  div_count;
-
-
-    // --------------------------------------------------------
-    // FSM
-    // --------------------------------------------------------
+    /*
+     * Bounded quotient engine.
+     *
+     * Output is only 4 bits and is saturated at 15.
+     * For positive denominator, quotient values >=15 are
+     * indistinguishable at the output. Therefore only 15
+     * subtraction decisions are required.
+     */
+    reg [10:0] quot_num;
+    reg [6:0]  quot_den;
+    reg [3:0]  quot_count;
+    reg [3:0]  quot_value;
 
     reg [1:0] state;
 
     localparam S_IDLE = 2'd0;
     localparam S_SCAN = 2'd1;
-    localparam S_DIV  = 2'd2;
+    localparam S_QUOT = 2'd2;
 
 
-    // ========================================================
-    // MEMBERSHIP FUNCTION
-    // ========================================================
+    // ============================================================
+    // Membership
+    // ============================================================
 
     function [3:0] memb;
-
         input [3:0] x;
         input [1:0] label;
 
-        reg [4:0] t;
-
         begin
-
             case (label)
 
-                // ------------------------------------------------
-                // LOW
-                // ------------------------------------------------
-
                 2'd0: begin
-
                     if (x <= 4'd7)
                         memb = 4'd15 - {x[2:0],1'b0};
                     else
                         memb = 4'd0;
-
                 end
-
-
-                // ------------------------------------------------
-                // MID
-                // ------------------------------------------------
 
                 2'd1: begin
-
                     if (x <= 4'd7)
-
                         memb = {x[2:0],1'b0};
-
-                    else begin
-
-                        t = 5'd30 - {1'b0,x,1'b0};
-
-                        memb = (t[4]) ?
-                               4'd0 :
-                               t[3:0];
-
-                    end
-
+                    else
+                        memb = 5'd30 - {1'b0,x,1'b0};
                 end
 
-
-                // ------------------------------------------------
-                // HIGH
-                // ------------------------------------------------
-
                 default: begin
-
                     if (x < 4'd8)
-
                         memb = 4'd0;
-
-                    else begin
-
-                        t = {1'b0,x} - 5'd7;
-                        t = {t[3:0],1'b0};
-
-                        memb = (t > 5'd15) ?
-                               4'd15 :
-                               t[3:0];
-
-                    end
-
+                    else
+                        memb = {1'b0,x} - 5'd7;
                 end
 
             endcase
-
         end
-
     endfunction
 
 
-    // ========================================================
-    // PEAK MEMBERSHIP LABEL
-    // ========================================================
+    // ============================================================
+    // Peak membership label
+    // ============================================================
 
     function [1:0] peak_label;
-
         input [3:0] x;
 
         begin
-
             if (x <= 4'd3)
-
                 peak_label = 2'd0;
-
             else if (x <= 4'd11)
-
                 peak_label = 2'd1;
-
             else
-
                 peak_label = 2'd2;
-
         end
-
     endfunction
 
 
-    // ========================================================
-    // CURRENT RULE DATAPATH
-    // ========================================================
+    // ============================================================
+    // Current packed rule fields
+    // ============================================================
 
-    wire [3:0] cur_m1;
-    wire [3:0] cur_m2;
-    wire [3:0] cur_fire;
-    wire [7:0] cur_prod;
+    wire [1:0] cur_a1 = rule_mem[rule_idx][10:9];
+    wire [1:0] cur_a2 = rule_mem[rule_idx][8:7];
+    wire [3:0] cur_y  = rule_mem[rule_idx][6:3];
+    wire [2:0] cur_u  = rule_mem[rule_idx][2:0];
 
-    assign cur_m1 =
-        memb(x1_r, rule_a1[rule_idx]);
+    wire [3:0] cur_m1 = memb(x1_r, cur_a1);
+    wire [3:0] cur_m2 = memb(x2_r, cur_a2);
 
-    assign cur_m2 =
-        memb(x2_r, rule_a2[rule_idx]);
+    wire [3:0] cur_fire =
+        (cur_m1 < cur_m2) ? cur_m1 : cur_m2;
 
-    // MIN fuzzy firing strength.
-    assign cur_fire =
-        (cur_m1 < cur_m2) ?
-        cur_m1 :
-        cur_m2;
-
-    // Firing strength × consequent.
-    assign cur_prod =
-        cur_fire * rule_y[rule_idx];
+    wire [7:0] cur_prod =
+        cur_fire * cur_y;
 
 
-    // ========================================================
-    // LAST RULE ACCUMULATION
-    // ========================================================
+    // ============================================================
+    // Final scan values
+    // ============================================================
 
-    wire [10:0] last_sum_num;
-    wire [6:0]  last_sum_den;
-
-    assign last_sum_num =
+    wire [10:0] last_sum_num =
         sum_num + cur_prod;
 
-    assign last_sum_den =
+    wire [6:0] last_sum_den =
         sum_den + cur_fire;
 
+    wire [3:0] last_max_fire =
+        (cur_fire > max_fire) ? cur_fire : max_fire;
 
-    // ========================================================
-    // LAST RULE MAXIMUM FIRING VALUE
-    // ========================================================
-
-    wire [3:0] last_max_fire;
-    wire [2:0] last_max_idx;
-
-    assign last_max_fire =
-        (cur_fire > max_fire) ?
-        cur_fire :
-        max_fire;
-
-    assign last_max_idx =
-        (cur_fire > max_fire) ?
-        rule_idx :
-        max_idx;
+    wire [2:0] last_max_idx =
+        (cur_fire > max_fire) ? rule_idx : max_idx;
 
 
-    // ========================================================
-    // RESTORING DIVIDER NEXT STATE
-    // ========================================================
+    // ============================================================
+    // Bounded quotient comparison
+    //
+    // quotient = numerator / denominator
+    //
+    // We only need the quotient up to 15 because the output is
+    // a 4-bit saturated value.
+    // ============================================================
 
-    wire [7:0] rem_shift;
-    wire       div_take;
-    wire [7:0] rem_next;
-    wire [10:0] quot_next;
+    wire quot_can_sub =
+        (quot_num >= {4'd0, quot_den});
 
-    assign rem_shift =
-        {div_rem[6:0], div_num[10]};
+    wire [10:0] quot_num_next =
+        quot_can_sub ?
+        (quot_num - {4'd0, quot_den}) :
+        quot_num;
 
-    assign div_take =
-        (rem_shift >= {1'b0, div_den});
-
-    assign rem_next =
-        div_take ?
-        (rem_shift - {1'b0, div_den}) :
-        rem_shift;
-
-    assign quot_next =
-        {div_quot[9:0], div_take};
+    wire [3:0] quot_value_next =
+        quot_can_sub ?
+        (quot_value + 4'd1) :
+        quot_value;
 
 
-    // ========================================================
-    // MAIN SEQUENTIAL PROCESS
-    // ========================================================
+    // ============================================================
+    // Main sequential process
+    // ============================================================
 
     always @(posedge clk or negedge rst_n) begin
 
         if (!rst_n) begin
-
-            // ------------------------------------------------
-            // Control
-            // ------------------------------------------------
 
             state    <= S_IDLE;
 
@@ -381,104 +257,42 @@ module olaf8_core (
             admitted <= 1'b0;
             busy     <= 1'b0;
 
-
-            // ------------------------------------------------
-            // Input state
-            // ------------------------------------------------
-
             x1_r <= 4'd0;
             x2_r <= 4'd0;
-
-
-            // ------------------------------------------------
-            // Rule scan state
-            // ------------------------------------------------
 
             rule_idx <= 3'd0;
 
             max_fire <= 4'd0;
             max_idx  <= 3'd0;
 
-
-            // ------------------------------------------------
-            // STEP 1:
-            // Minimum utility search state.
-            // ------------------------------------------------
-
             min_util_r <= 3'd7;
             min_idx_r  <= 3'd0;
-
-
-            // ------------------------------------------------
-            // Accumulators
-            // ------------------------------------------------
 
             sum_num <= 11'd0;
             sum_den <= 7'd0;
 
-
-            // ------------------------------------------------
-            // Divider
-            // ------------------------------------------------
-
-            div_num   <= 11'd0;
-            div_rem   <= 8'd0;
-            div_den   <= 7'd0;
-            div_quot  <= 11'd0;
-            div_count <= 4'd0;
+            quot_num   <= 11'd0;
+            quot_den   <= 7'd1;
+            quot_count <= 4'd0;
+            quot_value <= 4'd0;
 
 
-            // ------------------------------------------------
-            // Initial rule base
-            // ------------------------------------------------
+            // ------------------------------------------------------
+            // Same deterministic 8-rule initial rule base
+            // ------------------------------------------------------
 
-            rule_a1[0] <= 2'd0;
-            rule_a2[0] <= 2'd0;
-            rule_y [0] <= 4'd2;
-            rule_u [0] <= 3'd1;
-
-            rule_a1[1] <= 2'd0;
-            rule_a2[1] <= 2'd1;
-            rule_y [1] <= 4'd5;
-            rule_u [1] <= 3'd1;
-
-            rule_a1[2] <= 2'd0;
-            rule_a2[2] <= 2'd2;
-            rule_y [2] <= 4'd7;
-            rule_u [2] <= 3'd1;
-
-            rule_a1[3] <= 2'd1;
-            rule_a2[3] <= 2'd0;
-            rule_y [3] <= 4'd5;
-            rule_u [3] <= 3'd1;
-
-            rule_a1[4] <= 2'd1;
-            rule_a2[4] <= 2'd1;
-            rule_y [4] <= 4'd8;
-            rule_u [4] <= 3'd1;
-
-            rule_a1[5] <= 2'd1;
-            rule_a2[5] <= 2'd2;
-            rule_y [5] <= 4'd10;
-            rule_u [5] <= 3'd1;
-
-            rule_a1[6] <= 2'd2;
-            rule_a2[6] <= 2'd0;
-            rule_y [6] <= 4'd7;
-            rule_u [6] <= 3'd1;
-
-            rule_a1[7] <= 2'd2;
-            rule_a2[7] <= 2'd2;
-            rule_y [7] <= 4'd13;
-            rule_u [7] <= 3'd1;
+            rule_mem[0] <= 11'b00_00_0010_001;
+            rule_mem[1] <= 11'b00_01_0101_001;
+            rule_mem[2] <= 11'b00_10_0111_001;
+            rule_mem[3] <= 11'b01_00_0101_001;
+            rule_mem[4] <= 11'b01_01_1000_001;
+            rule_mem[5] <= 11'b01_10_1010_001;
+            rule_mem[6] <= 11'b10_00_0111_001;
+            rule_mem[7] <= 11'b10_10_1101_001;
 
         end
 
         else begin
-
-            // ------------------------------------------------
-            // One-cycle status pulses
-            // ------------------------------------------------
 
             done     <= 1'b0;
             admitted <= 1'b0;
@@ -487,9 +301,9 @@ module olaf8_core (
             case (state)
 
 
-                // ====================================================
+                // ==================================================
                 // IDLE
-                // ====================================================
+                // ==================================================
 
                 S_IDLE: begin
 
@@ -497,32 +311,19 @@ module olaf8_core (
 
                     if (start) begin
 
-                        // Capture input sample.
                         x1_r <= x1;
                         x2_r <= x2;
 
-                        // Start rule scan.
                         rule_idx <= 3'd0;
 
-                        // Clear maximum firing search.
                         max_fire <= 4'd0;
                         max_idx  <= 3'd0;
 
-                        // Clear weighted accumulation.
-                        sum_num <= 11'd0;
-                        sum_den <= 7'd0;
-
-                        // ------------------------------------------------
-                        // STEP 1:
-                        // Initialize least-utility search.
-                        //
-                        // Utility is 3 bits, so 7 is the maximum possible
-                        // utility value. Rule 0 will establish the initial
-                        // minimum during the first scan cycle.
-                        // ------------------------------------------------
-
                         min_util_r <= 3'd7;
                         min_idx_r  <= 3'd0;
+
+                        sum_num <= 11'd0;
+                        sum_den <= 7'd0;
 
                         busy  <= 1'b1;
                         state <= S_SCAN;
@@ -532,80 +333,56 @@ module olaf8_core (
                 end
 
 
-                // ====================================================
-                // RULE SCAN
-                // ====================================================
+                // ==================================================
+                // 8-RULE FUZZY SCAN
+                // ==================================================
 
                 S_SCAN: begin
 
                     busy <= 1'b1;
 
 
-                    // ------------------------------------------------
-                    // Existing fuzzy inference accumulation.
-                    // ------------------------------------------------
-
+                    // Fuzzy weighted accumulation.
                     sum_num <= sum_num + cur_prod;
                     sum_den <= sum_den + cur_fire;
 
 
-                    // ------------------------------------------------
-                    // Existing maximum firing-strength search.
-                    // ------------------------------------------------
-
+                    // Maximum firing strength.
                     if (cur_fire > max_fire) begin
-
                         max_fire <= cur_fire;
                         max_idx  <= rule_idx;
-
                     end
 
 
-                    // ------------------------------------------------
-                    // STEP 1 OPTIMIZATION
-                    //
                     // Sequential least-utility search.
-                    //
-                    // Instead of an always @* loop comparing all
-                    // eight rule utilities simultaneously, the
-                    // existing rule scan compares one utility per
-                    // cycle.
-                    //
-                    // Strict '<' preserves the original tie behavior:
-                    // the first rule with minimum utility is retained.
-                    // ------------------------------------------------
-
-                    if (rule_u[rule_idx] < min_util_r) begin
-
-                        min_util_r <= rule_u[rule_idx];
+                    if (cur_u < min_util_r) begin
+                        min_util_r <= cur_u;
                         min_idx_r  <= rule_idx;
-
                     end
 
 
-                    // ------------------------------------------------
-                    // Last rule of the 8-rule scan.
-                    // ------------------------------------------------
+                    if (rule_idx == 3'd7) begin
 
-                    if (rule_idx == N_RULES) begin
+                        /*
+                         * Start bounded quotient.
+                         *
+                         * If denominator is zero, use the same
+                         * safe fallback behavior as the reference.
+                         */
+                        quot_num <= last_sum_num;
 
-                        // Start restoring divider.
-                        div_num <= last_sum_num;
-
-                        div_den <=
+                        quot_den <=
                             (last_sum_den == 0) ?
                             7'd1 :
                             last_sum_den;
 
-                        div_rem   <= 8'd0;
-                        div_quot  <= 11'd0;
-                        div_count <= 4'd0;
+                        quot_count <= 4'd0;
+                        quot_value <= 4'd0;
 
-                        // Preserve final maximum firing result.
                         max_fire <= last_max_fire;
                         max_idx  <= last_max_idx;
 
-                        state <= S_DIV;
+                        state <= S_QUOT;
 
                     end
 
@@ -618,74 +395,46 @@ module olaf8_core (
                 end
 
 
-                // ====================================================
-                // ITERATIVE DIVISION
-                // ====================================================
+                // ==================================================
+                // BOUNDED DEFUZZIFICATION
+                // ==================================================
 
-                S_DIV: begin
+                S_QUOT: begin
 
                     busy <= 1'b1;
 
-                    // One quotient bit per cycle.
-                    div_rem  <= rem_next;
-                    div_num  <= {div_num[9:0],1'b0};
-                    div_quot <= quot_next;
+                    /*
+                     * Perform at most 15 useful subtraction steps.
+                     *
+                     * quotient >= 15 is saturated to 15, so no
+                     * additional division iterations are necessary.
+                     */
 
+                    if (quot_count == 4'd15) begin
 
-                    if (div_count == 4'd10) begin
+                        y <= quot_value;
 
-                        // ------------------------------------------------
-                        // Saturate quotient to 4-bit output.
-                        // ------------------------------------------------
-
-                        if (div_quot[10:4] != 0)
-
-                            y <= 4'd15;
-
-                        else
-
-                            y <= div_quot[3:0];
-
-
-                        // ------------------------------------------------
-                        // Firing-strength-gated online admission.
-                        //
-                        // UNCHANGED from baseline.
-                        // ------------------------------------------------
+                        // ------------------------------------------
+                        // Firing-strength-gated admission
+                        // ------------------------------------------
 
                         if (max_fire < ADMIT_THRESHOLD) begin
 
-                            // ------------------------------------------------
-                            // STEP 1:
-                            //
-                            // min_idx_r contains the least-utility
-                            // rule discovered during the scan.
-                            // ------------------------------------------------
+                            /*
+                             * Pack the newly admitted rule into the
+                             * selected least-utility slot.
+                             */
+                            rule_mem[min_idx_r][10:9]
+                                <= peak_label(x1_r);
 
-                            rule_a1[min_idx_r] <=
-                                peak_label(x1_r);
+                            rule_mem[min_idx_r][8:7]
+                                <= peak_label(x2_r);
 
-                            rule_a2[min_idx_r] <=
-                                peak_label(x2_r);
+                            rule_mem[min_idx_r][6:3]
+                                <= quot_value;
 
-
-                            if (div_quot[10:4] != 0)
-
-                                rule_y[min_idx_r] <= 4'd15;
-
-                            else if ((div_quot[3:0] == 0) &&
-                                     (sum_den == 0))
-
-                                rule_y[min_idx_r] <= 4'd8;
-
-                            else
-
-                                rule_y[min_idx_r] <=
-                                    div_quot[3:0];
-
-
-                            // New rule receives utility 4.
-                            rule_u[min_idx_r] <= 3'd4;
+                            rule_mem[min_idx_r][2:0]
+                                <= 3'd4;
 
                             admitted <= 1'b1;
 
@@ -693,17 +442,15 @@ module olaf8_core (
 
                         else begin
 
-                            // ------------------------------------------------
-                            // Existing winning-rule utility update.
-                            // ------------------------------------------------
-
-                            if (rule_u[max_idx] != 3'd7)
-
-                                rule_u[max_idx] <=
-                                    rule_u[max_idx] + 3'd1;
+                            /*
+                             * Increment winning-rule utility,
+                             * saturating at 7.
+                             */
+                            if (rule_mem[max_idx][2:0] != 3'd7)
+                                rule_mem[max_idx][2:0]
+                                    <= rule_mem[max_idx][2:0] + 3'd1;
 
                         end
-
 
                         done  <= 1'b1;
                         busy  <= 1'b0;
@@ -713,21 +460,61 @@ module olaf8_core (
 
                     else begin
 
-                        div_count <= div_count + 4'd1;
+                        /*
+                         * If numerator is already smaller than the
+                         * denominator, the quotient is complete.
+                         */
+                        if (quot_num < {4'd0, quot_den}) begin
+
+                            y <= quot_value;
+
+                            if (max_fire < ADMIT_THRESHOLD) begin
+
+                                rule_mem[min_idx_r][10:9]
+                                    <= peak_label(x1_r);
+
+                                rule_mem[min_idx_r][8:7]
+                                    <= peak_label(x2_r);
+
+                                rule_mem[min_idx_r][6:3]
+                                    <= quot_value;
+
+                                rule_mem[min_idx_r][2:0]
+                                    <= 3'd4;
+
+                                admitted <= 1'b1;
+
+                            end
+
+                            else begin
+
+                                if (rule_mem[max_idx][2:0] != 3'd7)
+                                    rule_mem[max_idx][2:0]
+                                        <= rule_mem[max_idx][2:0] + 3'd1;
+
+                            end
+
+                            done  <= 1'b1;
+                            busy  <= 1'b0;
+                            state <= S_IDLE;
+
+                        end
+
+                        else begin
+
+                            quot_num   <= quot_num_next;
+                            quot_value <= quot_value_next;
+                            quot_count <= quot_count + 4'd1;
+
+                        end
 
                     end
 
                 end
 
 
-                // ====================================================
-                // DEFAULT
-                // ====================================================
-
                 default: begin
-
                     state <= S_IDLE;
-
                 end
 
             endcase
@@ -737,6 +524,5 @@ module olaf8_core (
     end
 
 endmodule
-
 
 `default_nettype wire
