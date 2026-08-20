@@ -1,7 +1,7 @@
 # Tiny Tapeout project information
 project:
   title:        "OLAF-8: Bounded-Memory Online Adaptive Fuzzy Inference"
-  author:       "Mohammed Sharfuddin"
+  author:       "Mohammed Sharfuddin, Priya Asuti, Shylashree N, RV College of Engineering"
   discord:      ""
   description:  "An 8-rule digital fuzzy inference engine with bounded online rule admission and replacement."
   language:     "Verilog"
