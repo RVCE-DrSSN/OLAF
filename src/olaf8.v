@@ -1,341 +1,169 @@
-/*
- * OLAF-8: Bounded-Memory Online Adaptive Fuzzy Inference Engine
- * Tiny Tapeout SKY130 / Verilog
- * SPDX-License-Identifier: Apache-2.0
- *
- * Experimental area-optimization candidate.
- *
- * Preserved research mechanisms:
- *   - 8 bounded rule slots
- *   - 2-input fuzzy inference
- *   - fuzzy membership
- *   - MIN firing strength
- *   - firing-strength-gated online admission
- *   - least-utility rule replacement
- *   - shared streaming datapath
- *   - observable admission output
- *
- * Optimization organization:
- *   - packed 11-bit rule words
- *   - sequential least-utility search during the 8-rule scan
- *   - explicit membership truth tables
- *   - shift/add 4x4 product
- *   - bounded quotient engine (4-bit saturated output)
- *
- * IMPORTANT:
- * Cell count and timing must be confirmed by the actual Tiny Tapeout
- * synthesis/GDS flow. This file is a candidate, not a guaranteed
- * <=566-cell result.
- */
-
 `default_nettype none
 
-module tt_um_olaf8 (
+module tt_um_olaf8(
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
     input  wire [7:0] uio_in,
     output wire [7:0] uio_out,
     output wire [7:0] uio_oe,
-    input  wire       ena,
-    input  wire       clk,
-    input  wire       rst_n
+    input  wire ena,
+    input  wire clk,
+    input  wire rst_n
 );
 
     wire [3:0] y;
-    wire       done;
-    wire       admitted;
-    wire       busy;
+    wire done, admitted, busy;
 
-    olaf8_core core (
-        .x1(ui_in[7:4]),
-        .x2(ui_in[3:0]),
-        .start(uio_in[0] & ena),
-        .clk(clk),
-        .rst_n(rst_n),
-        .y(y),
-        .done(done),
-        .admitted(admitted),
-        .busy(busy)
+    olaf8_core core(
+        .x1(ui_in[7:4]), .x2(ui_in[3:0]),
+        .start(uio_in[0] & ena), .clk(clk), .rst_n(rst_n),
+        .y(y), .done(done), .admitted(admitted), .busy(busy)
     );
 
-    assign uo_out  = {1'b0, busy, admitted, done, y};
+    assign uo_out  = {1'b0,busy,admitted,done,y};
     assign uio_out = 8'b0;
     assign uio_oe  = 8'b0;
-
-    wire _unused = &{1'b0, uio_in[7:1], 1'b0};
 
 endmodule
 
 
-module olaf8_core (
-    input  wire [3:0] x1,
-    input  wire [3:0] x2,
-    input  wire       start,
-    input  wire       clk,
-    input  wire       rst_n,
-    output reg  [3:0] y,
-    output reg        done,
-    output reg        admitted,
-    output reg        busy
+module olaf8_core(
+    input  wire [3:0] x1, x2,
+    input  wire start, clk, rst_n,
+    output reg [3:0] y,
+    output reg done, admitted, busy
 );
 
-    localparam [3:0] ADMIT_THRESHOLD = 4'd6;
-
     /*
-     * Packed rule format:
-     *
-     * [10:9] antecedent 1
-     * [ 8:7] antecedent 2
-     * [ 6:3] consequent
-     * [ 2:0] utility
+     * One packed word per bounded rule:
+     * [10:9] a1, [8:7] a2, [6:3] consequent, [2:0] utility.
      */
     reg [10:0] rule [0:7];
 
-    reg [3:0] x1_r;
-    reg [3:0] x2_r;
-
-    reg [2:0] rule_idx;
-
+    reg [3:0] x1_r, x2_r;
+    reg [2:0] idx;
+    reg [2:0] min_idx;
+    reg [2:0] min_u;
     reg [3:0] max_fire;
     reg [2:0] max_idx;
 
-    reg [2:0] min_util;
-    reg [2:0] replace_idx;
-
-    reg [10:0] sum_num;
-    reg [6:0]  sum_den;
+    /*
+     * Shared accumulation state.
+     * numerator <= 8*15*15 = 1800
+     * denominator <= 8*15 = 120
+     */
+    reg [10:0] num;
+    reg [6:0] den;
 
     /*
-     * Bounded quotient state.
-     *
-     * We only expose a 4-bit saturated quotient. Therefore:
-     *
-     *   numerator / denominator >= 15  -> y = 15
-     *
-     * and at most 15 useful subtractions are required.
+     * Quotient state. Only a 4-bit saturated output is required.
+     * At most 15 useful subtractions are needed.
      */
-    reg [10:0] q_num;
-    reg [6:0]  q_den;
-    reg [3:0]  q_count;
-    reg [3:0]  q_value;
-
-    /*
-     * q_zero_den preserves the reference behavior:
-     * output y = 0 for zero denominator, while an admitted rule
-     * receives consequent 8.
-     */
-    reg q_zero_den;
+    reg [10:0] qnum;
+    reg [6:0] qden;
+    reg [3:0] q;
+    reg [3:0] qcount;
 
     reg [1:0] state;
+    localparam IDLE=2'd0, SCAN=2'd1, QUOT=2'd2;
 
-    localparam S_IDLE = 2'd0;
-    localparam S_SCAN = 2'd1;
-    localparam S_QUOT = 2'd2;
-
-
-    // ============================================================
-    // Exact finite membership tables
-    // ============================================================
-
-    function [3:0] memb;
+    function [3:0] mf;
         input [3:0] x;
-        input [1:0] label;
-
+        input [1:0] l;
         begin
-            case (label)
-
-                // LOW: max(0, 15 - 2*x)
+            case(l)
                 2'd0: begin
-                    case (x)
-                        4'd0: memb = 4'd15;
-                        4'd1: memb = 4'd13;
-                        4'd2: memb = 4'd11;
-                        4'd3: memb = 4'd9;
-                        4'd4: memb = 4'd7;
-                        4'd5: memb = 4'd5;
-                        4'd6: memb = 4'd3;
-                        4'd7: memb = 4'd1;
-                        default: memb = 4'd0;
+                    case(x)
+                        0:mf=15; 1:mf=13; 2:mf=11; 3:mf=9;
+                        4:mf=7;  5:mf=5;  6:mf=3;  7:mf=1;
+                        default:mf=0;
                     endcase
                 end
-
-                // MID:
-                // x<=7 : 2*x
-                // x>7  : 30-2*x
                 2'd1: begin
-                    case (x)
-                        4'd0:  memb = 4'd0;
-                        4'd1:  memb = 4'd2;
-                        4'd2:  memb = 4'd4;
-                        4'd3:  memb = 4'd6;
-                        4'd4:  memb = 4'd8;
-                        4'd5:  memb = 4'd10;
-                        4'd6:  memb = 4'd12;
-                        4'd7:  memb = 4'd14;
-                        4'd8:  memb = 4'd14;
-                        4'd9:  memb = 4'd12;
-                        4'd10: memb = 4'd10;
-                        4'd11: memb = 4'd8;
-                        4'd12: memb = 4'd6;
-                        4'd13: memb = 4'd4;
-                        4'd14: memb = 4'd2;
-                        default: memb = 4'd0;
+                    case(x)
+                        0:mf=0;  1:mf=2;  2:mf=4;  3:mf=6;
+                        4:mf=8;  5:mf=10; 6:mf=12; 7:mf=14;
+                        8:mf=14; 9:mf=12; 10:mf=10; 11:mf=8;
+                        12:mf=6; 13:mf=4; 14:mf=2; default:mf=0;
                     endcase
                 end
-
-                // HIGH: max(0, min(15, 2*(x-7)))
                 default: begin
-                    case (x)
-                        4'd0:  memb = 4'd0;
-                        4'd1:  memb = 4'd0;
-                        4'd2:  memb = 4'd0;
-                        4'd3:  memb = 4'd0;
-                        4'd4:  memb = 4'd0;
-                        4'd5:  memb = 4'd0;
-                        4'd6:  memb = 4'd0;
-                        4'd7:  memb = 4'd0;
-                        4'd8:  memb = 4'd2;
-                        4'd9:  memb = 4'd4;
-                        4'd10: memb = 4'd6;
-                        4'd11: memb = 4'd8;
-                        4'd12: memb = 4'd10;
-                        4'd13: memb = 4'd12;
-                        4'd14: memb = 4'd14;
-                        default: memb = 4'd15;
+                    case(x)
+                        0,1,2,3,4,5,6,7:mf=0;
+                        8:mf=2; 9:mf=4; 10:mf=6; 11:mf=8;
+                        12:mf=10; 13:mf=12; 14:mf=14; default:mf=15;
                     endcase
                 end
-
             endcase
         end
     endfunction
 
-
-    // ============================================================
-    // Peak label
-    // ============================================================
-
-    function [1:0] peak_label;
+    function [1:0] peak;
         input [3:0] x;
-
         begin
-            if (x <= 4'd3)
-                peak_label = 2'd0;
-            else if (x <= 4'd11)
-                peak_label = 2'd1;
-            else
-                peak_label = 2'd2;
+            if(x<=3) peak=0;
+            else if(x<=11) peak=1;
+            else peak=2;
         end
     endfunction
 
+    wire [1:0] a1 = rule[idx][10:9];
+    wire [1:0] a2 = rule[idx][8:7];
+    wire [3:0] ry = rule[idx][6:3];
+    wire [2:0] ru = rule[idx][2:0];
 
-    // ============================================================
-    // Current rule decode
-    // ============================================================
+    wire [3:0] m1 = mf(x1_r,a1);
+    wire [3:0] m2 = mf(x2_r,a2);
+    wire [3:0] fire = (m1<m2)?m1:m2;
 
-    wire [1:0] cur_a1 = rule[rule_idx][10:9];
-    wire [1:0] cur_a2 = rule[rule_idx][8:7];
-    wire [3:0] cur_y  = rule[rule_idx][6:3];
-    wire [2:0] cur_u  = rule[rule_idx][2:0];
+    /*
+     * Small 4x4 product. The synthesizer can share the add structure.
+     */
+    wire [7:0] p =
+        (fire[0] ? {4'b0,ry} : 8'b0) +
+        (fire[1] ? {3'b0,ry,1'b0} : 8'b0) +
+        (fire[2] ? {2'b0,ry,2'b0} : 8'b0) +
+        (fire[3] ? {1'b0,ry,3'b0} : 8'b0);
 
-    wire [3:0] cur_m1 = memb(x1_r, cur_a1);
-    wire [3:0] cur_m2 = memb(x2_r, cur_a2);
+    wire [10:0] nlast = num + {3'b0,p};
+    wire [6:0]  dlast = den + {3'b0,fire};
 
-    wire [3:0] cur_fire =
-        (cur_m1 < cur_m2) ? cur_m1 : cur_m2;
+    wire [3:0] fmax = (fire>max_fire)?fire:max_fire;
+    wire [2:0] imax = (fire>max_fire)?idx:max_idx;
 
+    wire qsub = (qnum >= {4'b0,qden});
 
-    // ============================================================
-    // 4x4 product using conditional shifts
-    // ============================================================
-
-    wire [7:0] prod0 =
-        cur_fire[0] ? {4'b0000, cur_y} : 8'd0;
-
-    wire [7:0] prod1 =
-        cur_fire[1] ? {3'b000, cur_y, 1'b0} : 8'd0;
-
-    wire [7:0] prod2 =
-        cur_fire[2] ? {2'b00, cur_y, 2'b00} : 8'd0;
-
-    wire [7:0] prod3 =
-        cur_fire[3] ? {1'b0, cur_y, 3'b000} : 8'd0;
-
-    wire [7:0] cur_prod =
-        prod0 + prod1 + prod2 + prod3;
-
-
-    // ============================================================
-    // Final scan values
-    // ============================================================
-
-    wire [10:0] final_num =
-        sum_num + {3'b000, cur_prod};
-
-    wire [6:0] final_den =
-        sum_den + {3'b000, cur_fire};
-
-    wire [3:0] final_max_fire =
-        (cur_fire > max_fire) ? cur_fire : max_fire;
-
-    wire [2:0] final_max_idx =
-        (cur_fire > max_fire) ? rule_idx : max_idx;
-
-
-    // ============================================================
-    // Bounded quotient next state
-    // ============================================================
-
-    wire q_can_sub =
-        (q_num >= {4'b0000, q_den});
-
-    wire [10:0] q_num_sub =
-        q_num - {4'b0000, q_den};
-
-    wire [3:0] q_value_sub =
-        q_value + 4'd1;
-
-
-    // ============================================================
-    // Sequential controller
-    // ============================================================
+    /*
+     * Finalize operation in one common path. This avoids duplicating
+     * admission/update logic in several FSM branches.
+     */
+    reg [3:0] final_y;
+    reg final_admit;
 
     always @(posedge clk or negedge rst_n) begin
+        if(!rst_n) begin
+            state <= IDLE;
+            y <= 4'd8;
+            done <= 0;
+            admitted <= 0;
+            busy <= 0;
 
-        if (!rst_n) begin
+            x1_r <= 0;
+            x2_r <= 0;
+            idx <= 0;
 
-            state       <= S_IDLE;
+            min_idx <= 0;
+            min_u <= 7;
+            max_fire <= 0;
+            max_idx <= 0;
 
-            y           <= 4'd8;
-            done        <= 1'b0;
-            admitted    <= 1'b0;
-            busy        <= 1'b0;
+            num <= 0;
+            den <= 0;
 
-            x1_r        <= 4'd0;
-            x2_r        <= 4'd0;
-
-            rule_idx    <= 3'd0;
-
-            max_fire    <= 4'd0;
-            max_idx     <= 3'd0;
-
-            min_util    <= 3'd7;
-            replace_idx <= 3'd0;
-
-            sum_num     <= 11'd0;
-            sum_den     <= 7'd0;
-
-            q_num       <= 11'd0;
-            q_den       <= 7'd1;
-            q_count     <= 4'd0;
-            q_value     <= 4'd0;
-            q_zero_den  <= 1'b0;
-
-
-            // ------------------------------------------------------
-            // Same initial rule base as supplied baseline
-            //
-            // [a1][a2][y][u]
-            // ------------------------------------------------------
+            qnum <= 0;
+            qden <= 1;
+            q <= 0;
+            qcount <= 0;
 
             rule[0] <= 11'b00_00_0010_001;
             rule[1] <= 11'b00_01_0101_001;
@@ -345,255 +173,143 @@ module olaf8_core (
             rule[5] <= 11'b01_10_1010_001;
             rule[6] <= 11'b10_00_0111_001;
             rule[7] <= 11'b10_10_1101_001;
+        end else begin
+            done <= 0;
+            admitted <= 0;
 
-        end
+            case(state)
 
-        else begin
-
-            done     <= 1'b0;
-            admitted <= 1'b0;
-
-            case (state)
-
-
-                // ==================================================
-                // IDLE
-                // ==================================================
-
-                S_IDLE: begin
-
-                    busy <= 1'b0;
-
-                    if (start) begin
-
+                IDLE: begin
+                    busy <= 0;
+                    if(start) begin
                         x1_r <= x1;
                         x2_r <= x2;
+                        idx <= 0;
 
-                        rule_idx <= 3'd0;
+                        min_idx <= 0;
+                        min_u <= 7;
 
-                        max_fire <= 4'd0;
-                        max_idx  <= 3'd0;
+                        max_fire <= 0;
+                        max_idx <= 0;
 
-                        min_util    <= 3'd7;
-                        replace_idx <= 3'd0;
+                        num <= 0;
+                        den <= 0;
 
-                        sum_num <= 11'd0;
-                        sum_den <= 7'd0;
-
-                        busy  <= 1'b1;
-                        state <= S_SCAN;
-
+                        busy <= 1;
+                        state <= SCAN;
                     end
-
                 end
 
+                SCAN: begin
+                    busy <= 1;
 
-                // ==================================================
-                // 8-cycle shared fuzzy scan
-                // ==================================================
+                    num <= num + {3'b0,p};
+                    den <= den + {3'b0,fire};
 
-                S_SCAN: begin
-
-                    busy <= 1'b1;
-
-                    // Weighted numerator.
-                    sum_num <= sum_num + {3'b000, cur_prod};
-
-                    // Firing-strength denominator.
-                    sum_den <= sum_den + {3'b000, cur_fire};
-
-                    // Maximum firing rule.
-                    if (cur_fire > max_fire) begin
-                        max_fire <= cur_fire;
-                        max_idx  <= rule_idx;
+                    if(ru < min_u) begin
+                        min_u <= ru;
+                        min_idx <= idx;
                     end
 
-                    // Least-utility rule.
-                    // Strict < preserves first minimum on ties.
-                    if (cur_u < min_util) begin
-                        min_util    <= cur_u;
-                        replace_idx <= rule_idx;
+                    if(fire > max_fire) begin
+                        max_fire <= fire;
+                        max_idx <= idx;
                     end
 
-                    if (rule_idx == 3'd7) begin
+                    if(idx==7) begin
+                        qnum <= nlast;
+                        qden <= (dlast==0) ? 7'd1 : dlast;
+                        q <= 0;
+                        qcount <= 0;
 
-                        max_fire <= final_max_fire;
-                        max_idx  <= final_max_idx;
+                        max_fire <= fmax;
+                        max_idx <= imax;
 
+                        state <= QUOT;
+                    end else begin
+                        idx <= idx + 1'b1;
+                    end
+                end
+
+                QUOT: begin
+                    busy <= 1;
+
+                    /*
+                     * Zero denominator: baseline output behavior.
+                     * Admission still occurs and receives y=8.
+                     */
+                    if(den==0) begin
+                        final_y <= 0;
+                        final_admit <= (max_fire < 6);
+                        y <= 0;
+
+                        if(max_fire < 6) begin
+                            rule[min_idx][10:9] <= peak(x1_r);
+                            rule[min_idx][8:7] <= peak(x2_r);
+                            rule[min_idx][6:3] <= 4'd8;
+                            rule[min_idx][2:0] <= 3'd4;
+                            admitted <= 1;
+                        end else if(rule[max_idx][2:0] != 7) begin
+                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
+                        end
+
+                        done <= 1;
+                        busy <= 0;
+                        state <= IDLE;
+
+                    end else if(!qsub) begin
                         /*
-                         * Preserve reference behavior:
-                         * denominator zero -> output 0, but an admitted
-                         * rule receives consequent 8.
+                         * Exact floor quotient has been reached.
                          */
-                        q_zero_den <= (final_den == 7'd0);
+                        final_y <= q;
+                        final_admit <= (max_fire < 6);
+                        y <= q;
 
-                        q_num <= final_num;
-
-                        q_den <=
-                            (final_den == 7'd0) ?
-                            7'd1 :
-                            final_den;
-
-                        q_count <= 4'd0;
-                        q_value <= 4'd0;
-
-                        state <= S_QUOT;
-
-                    end
-
-                    else begin
-
-                        rule_idx <= rule_idx + 3'd1;
-
-                    end
-
-                end
-
-
-                // ==================================================
-                // Saturating floor quotient
-                // ==================================================
-
-                S_QUOT: begin
-
-                    busy <= 1'b1;
-
-                    /*
-                     * If denominator was zero, reference output is 0.
-                     */
-                    if (q_zero_den) begin
-
-                        y <= 4'd0;
-
-                        if (max_fire < ADMIT_THRESHOLD) begin
-
-                            rule[replace_idx][10:9]
-                                <= peak_label(x1_r);
-
-                            rule[replace_idx][8:7]
-                                <= peak_label(x2_r);
-
-                            rule[replace_idx][6:3]
-                                <= 4'd8;
-
-                            rule[replace_idx][2:0]
-                                <= 3'd4;
-
-                            admitted <= 1'b1;
-
+                        if(max_fire < 6) begin
+                            rule[min_idx][10:9] <= peak(x1_r);
+                            rule[min_idx][8:7] <= peak(x2_r);
+                            rule[min_idx][6:3] <= q;
+                            rule[min_idx][2:0] <= 3'd4;
+                            admitted <= 1;
+                        end else if(rule[max_idx][2:0] != 7) begin
+                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
                         end
 
-                        else if (rule[max_idx][2:0] != 3'd7) begin
+                        done <= 1;
+                        busy <= 0;
+                        state <= IDLE;
 
-                            rule[max_idx][2:0]
-                                <= rule[max_idx][2:0] + 3'd1;
-
-                        end
-
-                        done  <= 1'b1;
-                        busy  <= 1'b0;
-                        state <= S_IDLE;
-
-                    end
-
-                    /*
-                     * Saturate once quotient reaches 15.
-                     */
-                    else if (q_value == 4'd15) begin
-
+                    end else if(q==4'd15 || qcount==4'd15) begin
+                        /*
+                         * Saturated 4-bit result.
+                         */
                         y <= 4'd15;
 
-                        if (max_fire < ADMIT_THRESHOLD) begin
-
-                            rule[replace_idx][10:9]
-                                <= peak_label(x1_r);
-
-                            rule[replace_idx][8:7]
-                                <= peak_label(x2_r);
-
-                            rule[replace_idx][6:3]
-                                <= 4'd15;
-
-                            rule[replace_idx][2:0]
-                                <= 3'd4;
-
-                            admitted <= 1'b1;
-
+                        if(max_fire < 6) begin
+                            rule[min_idx][10:9] <= peak(x1_r);
+                            rule[min_idx][8:7] <= peak(x2_r);
+                            rule[min_idx][6:3] <= 4'd15;
+                            rule[min_idx][2:0] <= 3'd4;
+                            admitted <= 1;
+                        end else if(rule[max_idx][2:0] != 7) begin
+                            rule[max_idx][2:0] <= rule[max_idx][2:0] + 1'b1;
                         end
 
-                        else if (rule[max_idx][2:0] != 3'd7) begin
+                        done <= 1;
+                        busy <= 0;
+                        state <= IDLE;
 
-                            rule[max_idx][2:0]
-                                <= rule[max_idx][2:0] + 3'd1;
-
-                        end
-
-                        done  <= 1'b1;
-                        busy  <= 1'b0;
-                        state <= S_IDLE;
-
+                    end else begin
+                        qnum <= qnum - {4'b0,qden};
+                        q <= q + 1'b1;
+                        qcount <= qcount + 1'b1;
                     end
-
-                    /*
-                     * Continue exact floor division while quotient < 15.
-                     */
-                    else if (q_can_sub) begin
-
-                        q_num   <= q_num_sub;
-                        q_value <= q_value_sub;
-                        q_count <= q_count + 4'd1;
-
-                    end
-
-                    /*
-                     * q_num < q_den => quotient is complete.
-                     */
-                    else begin
-
-                        y <= q_value;
-
-                        if (max_fire < ADMIT_THRESHOLD) begin
-
-                            rule[replace_idx][10:9]
-                                <= peak_label(x1_r);
-
-                            rule[replace_idx][8:7]
-                                <= peak_label(x2_r);
-
-                            rule[replace_idx][6:3]
-                                <= q_value;
-
-                            rule[replace_idx][2:0]
-                                <= 3'd4;
-
-                            admitted <= 1'b1;
-
-                        end
-
-                        else if (rule[max_idx][2:0] != 3'd7) begin
-
-                            rule[max_idx][2:0]
-                                <= rule[max_idx][2:0] + 3'd1;
-
-                        end
-
-                        done  <= 1'b1;
-                        busy  <= 1'b0;
-                        state <= S_IDLE;
-
-                    end
-
                 end
 
-
-                default: begin
-                    state <= S_IDLE;
-                end
+                default: state <= IDLE;
 
             endcase
-
         end
-
     end
 
 endmodule
